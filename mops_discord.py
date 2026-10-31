@@ -47,7 +47,9 @@ DEFAULTS = {
     "selfreport_keywords": ["自結", "自行結算"],
     "news_exclude_keywords": [],          # 主旨含這些字的重大訊息不推(例如「代子公司」)
     "news_desc_chars": 800,               # 重大訊息說明最多顯示幾個字
-    "detail_max_per_run": 80,             # 每次最多補抓幾則說明(其餘下次)
+    "detail_max_per_run": 80,
+    "history_every_min": 15,              # 補漏:每隔幾分鐘查一次「指定日期的全部重大訊息」
+    "history_days": 4,                    # 補漏:查今天往前幾天(含週末)             # 每次最多補抓幾則說明(其餘下次)
     "revenue_every_min": 30,
     "financial_every_min": 60,
     "loop_seconds": 60,
@@ -266,6 +268,43 @@ def news_list(mkt):
     return rows
 
 
+HISTORY = f"{MOPS}/mops/web/ajax_t05st02"
+
+
+def news_history(d):
+    """指定日期(含前一日盤後)的全部重大訊息,說明全文一起回傳。"""
+    page = fetch(HISTORY, "post", {"encodeURIComponent": 1, "step": 1, "step00": 0, "firstin": 1,
+                                   "off": 1, "TYPEK": "all", "year": d.year - 1911,
+                                   "month": f"{d.month:02d}", "day": f"{d.day:02d}"})
+    if page is None:
+        return []
+    rows = []
+    for tr in re.findall(r"<tr class='(?:odd|even)'>(.*?)</tr>", page, re.S):
+        fm = re.search(r"name='(\w+?)_fm(\d+)'", tr)
+        if not fm:
+            continue
+        mkt = fm.group(1)
+        pairs = re.findall(r"name='(h\d+)' value='([^']*)'", tr, re.S)
+        if not pairs:
+            continue
+        base = pairs[0][0][:-1]          # 欄位名是流水號:h{序號}{0~8}
+        h = {k[-1]: html.unescape(v) for k, v in pairs if k[:-1] == base}
+        code, date_, tm = h.get("1", "").strip(), roc_date(h.get("2")), hms(h.get("3"))
+        if not code or not date_:
+            continue
+        r = {"mkt": mkt, "code": code, "name": h.get("0", "").strip(), "date": date_, "time": tm,
+             "subject": re.sub(r"\s+", " ", h.get("4", "")).strip(),
+             "form": {"SEQ_NO": h.get("5", ""), "SPOKE_TIME": h.get("3", ""),
+                      "SPOKE_DATE": h.get("2", ""), "COMPANY_ID": code},
+             "desc": h.get("8", "").replace("\r\n", "\n").strip(), "history": True}
+        if h.get("6", "").strip():
+            r["clause"] = f"第{h['6'].strip()}款"
+        if h.get("7", "").strip():
+            r["eventDate"] = roc_date(h["7"]) or h["7"]
+        rows.append(r)
+    return rows
+
+
 def news_key(r):
     f = r["form"]
     return f"{r['code']}|{r['date']}|{r['time']}|{f.get('SEQ_NO', '')}"
@@ -310,7 +349,7 @@ def news_embed(cfg, r, selfreport):
          "url": news_link(r),
          "color": COLORS["selfreport" if selfreport else "news"],
          "fields": fields,
-         "footer": {"text": "公開資訊觀測站・即時重大訊息"}}
+         "footer": {"text": "公開資訊觀測站・即時重大訊息" + ("(補發)" if r.get("history") else "")}}
     if desc:
         e["description"] = desc[:4000]
     try:
@@ -332,6 +371,26 @@ def run_news(cfg, st, seed):
             continue
         print(f"[重大訊息 {MKT_NAME.get(mkt, mkt)}] 今日 {len(rows)} 則")
         new += [r for r in rows if news_key(r) not in seen]
+    if not seed and due(st, "news_hist", cfg["history_every_min"]):
+        keys = {news_key(r) for r in new}
+        cut = (now().date() - timedelta(days=cfg["history_days"])).isoformat()
+        got = 0
+        for back in range(cfg["history_days"]):
+            d = now().date() - timedelta(days=back)
+            try:
+                hist = news_history(d)
+            except Exception as e:  # noqa: BLE001
+                print(f"[補漏 {d}] 失敗:{e}", file=sys.stderr)
+                continue
+            for r in hist:
+                k = news_key(r)
+                if r["mkt"] in cfg["markets"] and r["date"] >= cut and k not in seen and k not in keys:
+                    keys.add(k)
+                    new.append(r)
+                    got += 1
+            time.sleep(1)
+        mark(st, "news_hist")
+        print(f"[補漏] 找到 {got} 則先前漏掉的重大訊息")
     new.sort(key=lambda r: (r["date"], r["time"], r["code"]))
 
     if seed:
@@ -345,11 +404,12 @@ def run_news(cfg, st, seed):
             if any(k in r["subject"] for k in excl):
                 seen[news_key(r)] = r["date"]
                 continue
-            try:
-                news_detail(r)
-            except Exception as e:  # noqa: BLE001
-                print(f"[說明] {r['code']} {r['time']} 失敗:{e}(仍會推送標題)", file=sys.stderr)
-            time.sleep(0.5)
+            if not r.get("history"):
+                try:
+                    news_detail(r)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[說明] {r['code']} {r['time']} 失敗:{e}(仍會推送標題)", file=sys.stderr)
+                time.sleep(0.5)
             kind = "selfreport" if is_selfreport(cfg, r["subject"]) else "news"
             out[kind].append((r, news_embed(cfg, r, kind == "selfreport")))
         # 依 Webhook 分組送出;送成功才記為已推送
